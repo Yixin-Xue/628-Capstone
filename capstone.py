@@ -61,6 +61,39 @@ def download_csse_to_disk(out_dir: str = "data"):
     return saved_paths
 
 
+def load_timeseries(prefer_local: bool = True, data_dir: str = "data"):
+    """
+    Load time-series DataFrames with resilience:
+    - try remote first (streamlit cloud) or local first (CLI)
+    - fall back to local CSVs shipped in the repo if a remote fetch fails
+    Returns (dataframes, errors)
+    """
+    local_paths = {name: Path(data_dir) / f"{name}.csv" for name in CSSE_FILES}
+    data: dict[str, pd.DataFrame] = {}
+    errors: dict[str, str] = {}
+
+    for name, url in CSSE_FILES.items():
+        def read_local():
+            return pd.read_csv(local_paths[name])
+
+        primary_first = "local" if prefer_local else "remote"
+
+        for attempt in (primary_first, "remote" if primary_first == "local" else "local"):
+            try:
+                if attempt == "local":
+                    data[name] = read_local()
+                else:
+                    data[name] = pd.read_csv(url)
+                break  # success
+            except Exception as exc:  # noqa: BLE001
+                errors[name] = f"{attempt} load failed: {exc}"
+        else:
+            # Loop exhausted without break -> both failed
+            continue
+
+    return data, errors
+
+
 def load_and_clean_timeseries(source):
     # Step 2: read one time-series table and drop Lat/Long, keep region + dates
     if isinstance(source, pd.DataFrame):
@@ -180,25 +213,45 @@ def prepare_for_downstream(
 
 def build_dataset():
     # Run full pipeline and return sorted long table plus metadata
-    saved = download_csse_to_disk()
-    cleaned = {
-        name: normalize_country_names(load_and_clean_timeseries(path), COUNTRY_ALIASES)
-        for name, path in saved.items()
-    }
+    # Streamlit Cloud 不依赖本地 CSV，优先从远程拉取
+    prefer_local = os.environ.get("STREAMLIT_SERVER_RUNNING") is None
+    raw_tables, load_errors = load_timeseries(prefer_local=prefer_local)
+
+    if not raw_tables:
+        raise RuntimeError("No COVID-19 tables could be loaded from remote or local sources.")
+
+    cleaned = {}
+    for name, df in raw_tables.items():
+        try:
+            cleaned[name] = normalize_country_names(load_and_clean_timeseries(df), COUNTRY_ALIASES)
+        except Exception as exc:  # noqa: BLE001
+            load_errors[name] = load_errors.get(name, "") + f"; clean failed: {exc}"
+
+    if not cleaned:
+        raise RuntimeError("Failed to clean any COVID-19 tables.")
+
     aggregated = {name: aggregate_by_country(df) for name, df in cleaned.items()}
 
     # Wide -> long + metric tag + daily + rolling mean + recovered flag
     long_tables = {}
     for name, agg_df in aggregated.items():
-        long_df = wide_to_long(agg_df)
-        long_df = add_metric_column(long_df, name)
-        long_df = compute_daily_from_cumulative(long_df)
-        long_tables[name] = long_df
+        try:
+            long_df = wide_to_long(agg_df)
+            long_df = add_metric_column(long_df, name)
+            long_df = compute_daily_from_cumulative(long_df)
+            long_tables[name] = long_df
+        except Exception as exc:  # noqa: BLE001
+            load_errors[name] = load_errors.get(name, "") + f"; long/compute failed: {exc}"
+
+    if not long_tables:
+        raise RuntimeError("No metrics available after processing.")
 
     merged = concat_metrics(long_tables)
     merged = add_rolling_mean(merged, col="daily", window=7)
     merged = flag_recovered_incomplete(merged)
     sorted_df, meta = prepare_for_downstream(merged)
+    meta["available_metrics"] = sorted(long_tables.keys())
+    meta["warnings"] = [f"{k}: {v}" for k, v in load_errors.items() if v]
     return sorted_df, meta
 
 
@@ -212,6 +265,10 @@ def run_streamlit_app():
 
     df, meta = cached_dataset()
 
+    if meta.get("warnings"):
+        for msg in meta["warnings"]:
+            st.warning(f"Data load warning – {msg}")
+
     st.title("Global COVID-19 Time Series (CSSE)")
     st.caption("Data source: Johns Hopkins CSSE time_series* (auto-fetched).")
 
@@ -219,8 +276,10 @@ def run_streamlit_app():
     countries = st.multiselect(
         "Countries", meta["countries"], default=meta["countries"][:5]
     )
+    available_metrics = meta.get("available_metrics", ["confirmed", "deaths", "recovered"])
+    default_metrics = [m for m in ("confirmed", "deaths", "recovered") if m in available_metrics]
     metrics = st.multiselect(
-        "Metrics", ["confirmed", "deaths", "recovered"], default=["confirmed", "deaths"]
+        "Metrics", available_metrics, default=default_metrics
     )
     date_min = meta["date_min"].to_pydatetime() if hasattr(meta["date_min"], "to_pydatetime") else meta["date_min"]
     date_max = meta["date_max"].to_pydatetime() if hasattr(meta["date_max"], "to_pydatetime") else meta["date_max"]
@@ -231,7 +290,13 @@ def run_streamlit_app():
         max_value=date_max,
     )
     use_rolling = st.checkbox("Show 7-day average", value=True)
-    show_recovered = st.checkbox("Include recovered (data incomplete)", value=False)
+    recovered_available = "recovered" in available_metrics
+    show_recovered = recovered_available and st.checkbox(
+        "Include recovered (data incomplete)", value=True
+    )
+
+    if not recovered_available:
+        st.info("Recovered series not available (source often incomplete).")
 
     filtered = df[
         (df["Country/Region"].isin(countries))
