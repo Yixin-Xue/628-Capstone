@@ -289,7 +289,8 @@ def run_streamlit_app():
         min_value=date_min,
         max_value=date_max,
     )
-    use_rolling = st.checkbox("Show 7-day average", value=True)
+    display_mode = st.radio("Display", ["Daily", "Cumulative"], index=0)
+    use_rolling = display_mode == "Daily" and st.checkbox("Show 7-day average", value=True)
     recovered_available = "recovered" in available_metrics
     show_recovered = recovered_available and st.checkbox(
         "Include recovered (data incomplete)", value=True
@@ -304,8 +305,12 @@ def run_streamlit_app():
         & (df["date"].between(date_range[0], date_range[1]))
     ].copy()
 
-    value_col = "daily_7d_avg" if use_rolling else "daily"
-    y_label = "Daily (7d avg)" if use_rolling else "Daily"
+    if display_mode == "Cumulative":
+        value_col = "cumulative"
+        y_label = "Cumulative"
+    else:
+        value_col = "daily_7d_avg" if use_rolling else "daily"
+        y_label = "Daily (7d avg)" if use_rolling else "Daily"
 
     if filtered.empty:
         st.info("No data for current selection.")
